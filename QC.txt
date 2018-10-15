@@ -1,0 +1,212 @@
+#QC for UKB
+
+#merge chromosome binary files together and keep cases/controls
+
+setwd("/projects/lindstroem/BreastCancer/ukbb/GenotypeData/")
+system("plink --bfile ukb_cal_chr1_v2 --bim ukb_snp_chr1_v2.bim --fam ../cam/agemen.fam --keep ./QC/keep.txt --merge-list ./QC/mergelist.txt --make-bed --out ./QC/ukb_snp_all")
+
+
+#Check inbreeding
+setwd("/projects/lindstroem/BreastCancer/ukbb/GenotypeData/QC/")
+system("plink --bed ukb_snp_all.bed --bim ukb_snp_all.bim --fam ukb_snp_all.fam --allow-no-sex --indep-pairwise 200 10 0.1 --het --out ukb")
+#use ukb.pruned.out to exclude dependent SNPs
+
+R
+#Check for excess homozygosity from .het files
+setwd("/projects/lindstroem/BreastCancer/ukbb/GenotypeData/QC")
+ukb_het <- read.table("ukb.het", header = TRUE, quote = "")
+ukb_het$o.het.rate = (ukb_het$N.NM.-ukb_het$O.HOM.)/ukb_het$N.NM.
+mean = mean(ukb_het$o.het.rate)
+sd = sd(ukb_het$o.het.rate)
+ukb_het$sd <- abs(ukb_het$o.het.rate-mean)/sd
+
+exclude <- subset(ukb_het, ukb_het$sd>3) #exclude those >3 sd (N=410)
+write.table(exclude[1], "exclude_het.txt", quote = FALSE, row.names = FALSE, col.names = FALSE)
+
+#identify up to third degree relatives using King
+setwd("projects/lindstroem/BreastCancer/ukbb/GenotypeData/QC")
+system("king -b ukb_snp_all.bed --related --degree 3") 
+
+#merge with fam file (phenotype data)
+king <- read.table("/projects/lindstroem/BreastCancer/ukbb/GenotypeData/QC/king.kin0", header = T)
+rel <- subset(king, Kinship>0.0884)
+fam <- read.table("/projects/lindstroem/BreastCancer/ukbb/GenotypeData/newfam.fam", as.is = T)
+
+exclude.het <- read.table("/projects/lindstroem/BreastCancer/ukbb/GenotypeData/exclude_het.txt", as.is=T)
+
+x <- merge(rel, fam[,c("V1","V6")], by.x = "ID1", by.y = "V1", all.x = T, all.y = F)
+x <- merge(x, fam[,c("V1","V6")], by.x = "ID2", by.y = "V1", all.x = T, all.y = F)
+
+#table(x$V6.x, x$V6.y) #check case/control status of pairs
+#	1	2
+#1	429	104
+#2	107	56
+
+#summary(x[(x$V6.x==1 & x$V6.y==1),"ID1"])
+#   Min. 1st Qu.  Median    Mean 3rd Qu.    Max. 
+#1003355 1581704 2440152 2657896 3632862 5705204 
+
+a <- x[(x$V6.x==1 & x$V6.y==1) & x$ID1<2440152,"ID1"]
+b <- x[(x$V6.x==1 & x$V6.y==2), "ID1"]
+c <- x[(x$V6.x==2 & x$V6.y==1), "ID2"]
+#summary(x[(x$V6.x==2 & x$V6.y==2),"ID1"])
+#   Min. 1st Qu.  Median    Mean 3rd Qu.    Max. 
+#1006184 1552258 2248248 2471985 3253715 5104120 
+d <- x[(x$V6.x==2 & x$V6.y==2) & x$ID1<2248248,"ID1"]
+
+z <- c(a,b,c,d)
+exclude_kin <- subset(x, x$ID1 %in% z)
+
+write.table(z[unique(z$ID1),c("ID1","ID1")], "/projects/lindstroem/BreastCancer/ukbb/GenotypeData/QC/exclude_kin.txt", quote = F, row.names = F, col.names = F)
+
+#remove all controls and individuals failing QC
+system("cat exclude_* | sort -k1 | uniq > exclude_kin_controls.txt")
+
+#generate PCs
+fileConn<-file("job.csh")
+writeLines(c("cd /projects/lindstroem/BreastCancer/ukbb/GenotypeData/QC",
+"plink -bfile ukb_snp_all -pca -remove-fam exclude_kin_controls.txt -exclude ukb.prune.out -out ukb.pruned.excluded"), fileConn)
+close(fileConn)
+system("qsub -q lindstroem.q job.csh")
+
+library(data.table)
+setwd("/projects/lindstroem/BreastCancer/ukbb/GenotypeData/QC")
+eigenvec <- fread("plink.eigenvec")
+
+#check first 10 PCs
+#pairs(eigenvec[,3:12])
+
+write.table(eigenvec[,1:12], "ukb_10pcs.txt", quote = F, row.names = F, col.names = F)
+
+#run GxE
+write.table(fam[fam$V6==2, 1], "keep_cases.txt", quote = F, row.names = F, col.names = F) #keep only cases (remove-fam will remove relatives)
+
+#case only analysis
+fileConn<-file("job.csh")
+writeLines(c("cd /projects/lindstroem/BreastCancer/ukbb/GenotypeData/QC",
+"plink --bfile ukb_snp_all --pheno ../../cam/agemen.pheno --linear --allow-no-sex --maf 0.01 --geno 0.05 --ci 0.95 --keep-fam keep_cases.txt --remove-fam exclude_kin_controls.txt --exclude ukb.prune.out --covar ukb_10pc.txt --out ukb_caseonly_agemen"), fileConn)
+close(fileConn)
+system("qsub -q lindstroem.q job.csh")
+
+system("cat keep_cases.txt exclude_kin_controls.txt | sort -k1 | uniq > exclude_kin_cases.txt") #create remove kin and cases file
+#controls only analysis
+fileConn<-file("job.csh")
+writeLines(c("cd /projects/lindstroem/BreastCancer/ukbb/GenotypeData/QC",
+"plink --bfile ukb_snp_all --pheno ../../cam/agemen.pheno --linear --allow-no-sex --maf 0.01 --geno 0.05 --ci 0.95 --remove-fam exclude_kin_cases.txt --exclude ukb.prune.out --covar ukb_10pc.txt --out ukb_controlonly_agemen"), fileConn)
+close(fileConn)
+system("qsub -q lindstroem.q job.csh")
+
+
+#read results
+library(qqman)
+linear <- fread("ukb_caseonly_agemen.assoc.linear")
+linear_add <- linear[linear$TEST=="ADD",]
+
+jpeg("ukb_caseonly_agemen_manhattan.jpeg")
+manhattan(linear_add)
+dev.off()
+
+jpeg("ukb_caseonly_agemen_qqplot.jpeg")
+qq(linear_add$P)
+dev.off()
+
+x<-linear_add[order(linear_add$P),]
+library(xlsx)
+write.xlsx(x[1:10], "ukb_caseonly_agemen_topresults.xlsx")
+
+#combine with annotations dataset
+annot <- fread("/projects/lindstroem/BreastCancer/WHI/cam/Annotations/annotations_categories.txt")
+
+#fu** the case-only analysis
+fileConn<-file("job.csh") 
+writeLines(c("/projects/lindstroem/BreastCancer/ukbb/GenotypeData/",
+"plink --bfile ukb_cal_chr1_v2 --bim ukb_snp_chr1_v2.bim --fam newfam.fam --keep ./QC/keep.txt --merge-list ./QC/mergelist.txt --make-bed --out ./QC/ukb_all",
+"/projects/lindstroem/BreastCancer/ukbb/GenotypeData/QC/",
+"plink --bfile ukb_all --linear --allow-no-sex --maf 0.01 --geno 0.05 --ci 0.95 --remove-fam exclude_kin_controls.txt --exclude ukb.prune.out --covar ukb_covar.txt --out ukb_gxe_agemen"), fileConn)
+close(fileConn)
+system("qsub -q lindstroem.q job.csh")
+
+covar <- fread("ukb_10pc.txt")
+
+fileConn<-file("job.csh") 
+writeLines(c("/projects/lindstroem/BreastCancer/ukbb/GenotypeData/QC/",
+"plink --bfile ukb_snp_all --logistic --allow-no-sex --maf 0.01 --geno 0.05 --ci 0.95 --remove-fam exclude_kin_controls.txt --exclude ukb.prune.out --covar ukb_covar.txt --interaction --out ukb_gxe_agemen"), fileConn)
+close(fileConn)
+system("qsub -q lindstroem.q job.csh")
+
+x <- fread("ukb_gxe_agemen.assoc.logistic")
+x <- subset(x, x$TEST=="ADDxCOV11")
+x <- x[order(x$P),]
+
+
+jpeg("ukb_gxe_agemen_manhattan.jpeg")
+manhattan(x)
+dev.off()
+
+jpeg("ukb_gxe_agemen_qqplot.jpeg")
+qq(x$P)
+dev.off()
+
+library(xlsx)
+write.xlsx(x[1:10], "ukb_gxe_agemen_topresults.xlsx")
+
+#merge with annotations file
+annot <- read.table("../../../WHI/cam/Annotations/annotations_categories.txt", header = T)
+results <- merge(x, annot, by.x = "SNP", by.y = "RSID")
+x <- results
+
+#generate qqplot with functional annotation categories
+functional_annotation_qqplot <- function(x){
+coding<-subset(x, x$annot=="coding")
+utr<-subset(x, x$annot=="UTR")
+promoter<-subset(x, x$annot=="promoter")
+dhs<-subset(x, x$annot=="DHS")
+intron<-subset(x, x$annot=="intron")
+other<-subset(x, x$annot=="other")
+x1<-ppoints(coding$P)
+x2<-ppoints(utr$P)
+x3<-ppoints(promoter$P)
+x4<-ppoints(dhs$P)
+x5<-ppoints(intron$P)
+x6<-ppoints(other$P)
+
+plot(-log10(x6), -log10(sort(other$P)),col="grey", pch = 20)
+abline(a=0,b=1,lty=2,col="black")
+points(-log10(x5), -log10(sort(intron$P)),col="purple", pch = 20)
+points(-log10(x4), -log10(sort(dhs$P)),col="green", pch = 20)
+points(-log10(x3), -log10(sort(promoter$P)),col="yellow", pch = 20)
+points(-log10(x2), -log10(sort(utr$P)),col="blue", pch = 20)
+points(-log10(x1), -log10(sort(coding$P)),col="red", pch = 20)
+legend(x="topleft", legend=c("Coding","UTR","Promoter","DHS","Intron","Other"),col=c("red","blue","yellow","green","purple","grey"), pch = 20)}
+
+jpeg("ukb_gxe_agemen_annot_qqplot.jpeg")
+functional_annotation_qqplot(results)
+dev.off()
+
+garfield_8 <- subset(garfield, garfield$PThresh==1e-08, select = c("OR","Annotation"))
+results$Annotation <- toupper(results$annot)
+results <- merge(results, garfield_8, by="Annotation")
+
+#scale OR
+tc <- c(3865, 1628, 3988, 33128, 35174, 59299)
+e <- unlist(garfield_8$OR)
+scale <- e[1]/((1/sum(tc)*sum(e*tc)))
+over <- sum(results$OR.y)/length(results$OR.y)
+
+results$scaled_OR <- ifelse(results$Annotation %in% "CODING", garfield_8[[1]][[1]]/(sum(results$OR.y)/length(results$OR.y)),
+						ifelse(results$Annotation %in% "UTR", garfield_8[[1]][[2]]/(sum(results$OR.y)/length(results$OR.y)),
+						ifelse(results$Annotation %in% "PROMOTER", garfield_8[[1]][[3]]/(sum(results$OR.y)/length(results$OR.y)),
+						ifelse(results$Annotation %in% "DHS", garfield_8[[1]][[4]]/(sum(results$OR.y)/length(results$OR.y)),
+						ifelse(results$Annotation %in% "INTRON", garfield_8[[1]][[5]]/(sum(results$OR.y)/length(results$OR.y)),
+						garfield_8[[1]][[6]]/(sum(results$OR.y)/length(results$OR.y)))))))
+
+results$weighted_P <- results$scaled_OR*results$P
+
+jpeg("ukb_weighted_agemen_manhattan.jpeg")
+manhattan(results, p = "weighted_P")
+dev.off()
+
+
+
+
+
